@@ -8,3 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.tfvars.json
+*.tfplan
+.terraform.lock.hcl
+
+# Lambda Zips
+*.zip

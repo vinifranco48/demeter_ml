@@ -2,104 +2,132 @@ import argparse
 import cv2
 import numpy as np
 import os
-from .processing import load_image, preprocess_image, segment_grains
-from .features import extract_all_features
-from .analysis import analyze_grain_rules
+import json
+import csv
+from .grain_classifier import GrainClassifierPipeline, GrainQuality
+from .llm import analyze_grains_with_llm
 
 def main():
     parser = argparse.ArgumentParser(description="Grain Classification System")
     parser.add_argument("image_path", help="Path to the image to analyze")
-    parser.add_argument("--train", action="store_true", help="Train the model on the input image (unsupervised)")
-    parser.add_argument("--model", default="kmeans_model.pkl", help="Path to save/load the model")
+    parser.add_argument("--api-key", help="Groq API key for LLM report (optional)", default=None)
     
     args = parser.parse_args()
     
-    try:
-        image = load_image(args.image_path)
-    except Exception as e:
-        print(f"Error: {e}")
+    # Handle API key
+    api_key = args.api_key or os.environ.get("GROQ_API_KEY")
+    
+    # Load image
+    if not os.path.exists(args.image_path):
+        print(f"Error: Image not found at {args.image_path}")
+        return
+        
+    # Read image using numpy to handle potential path encoding issues
+    stream = np.fromfile(args.image_path, dtype=np.uint8)
+    image = cv2.imdecode(stream, cv2.IMREAD_COLOR)
+    
+    if image is None:
+        print(f"Error: Could not decode image at {args.image_path}")
         return
 
-    print("Preprocessing image...")
-    processed_image = preprocess_image(image)
+    print("\nProcessing image with GrainClassifierPipeline...")
     
-    print("Segmenting grains...")
-    grain_masks, _ = segment_grains(processed_image)
-    print(f"Found {len(grain_masks)} grains.")
+    # Initialize and run pipeline
+    pipeline = GrainClassifierPipeline()
+    annotated_image, report = pipeline.process(image)
     
-    if len(grain_masks) == 0:
-        print("No grains found.")
-        return
+    # Print basic results
+    print(f"\nFound {report['total_graos']} grains.")
+    print("\nClassification Summary:")
+    for quality, count in report['classificacao'].items():
+        if count > 0:
+            print(f"  - {quality}: {count} ({report['percentuais'][quality]}%)")
+            
+    print("\nDefects Found:")
+    if report['defeitos_encontrados']:
+        for defect, count in report['defeitos_encontrados'].items():
+            print(f"  - {defect}: {count}")
+    else:
+        print("  - None")
 
-    print("Extracting features and analyzing...")
+    # Save result image
+    output_image_path = "result.jpg"
+    cv2.imwrite(output_image_path, annotated_image)
+    print(f"\nResult image saved to {output_image_path}")
     
-    results = []
-    all_features = []
-    for i, grain in enumerate(grain_masks):
-        feats = extract_all_features(grain)
-        all_features.append(feats)
-        analysis = analyze_grain_rules(feats)
-        results.append(analysis)
-        print(f"Grain {i}: {analysis['classification']} - {analysis['reasons']}")
-
-    # Summary
-    good_count = sum(1 for r in results if r['classification'] == "Good")
-    print(f"\nSummary: {good_count}/{len(grain_masks)} grains are Good.")
-
-    print("Generating result image...")
-    result_image = image.copy()
-    
-    # Save features to CSV
-    import csv
-    with open("features.csv", "w", newline="") as f:
+    # Save CSV results
+    csv_path = "analysis_results.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        # Header
         writer.writerow([
-            "Grain_ID", 
-            "Mean_B", "Mean_G", "Mean_R", 
-            "Mean_H", "Mean_S", "Mean_V", 
-            "Mean_L", "Mean_A", "Mean_B_Lab",
-            "Area", "Perimeter", "Circularity", "AspectRatio",
-            "Classification", "Reasons"
+            "Grain_ID", "Quality", "Confidence", "Area", 
+            "Circularity", "Aspect_Ratio", "Defects"
         ])
+        
+        for grain in report['graos']:
+            writer.writerow([
+                grain['id'],
+                grain['qualidade'],
+                grain['confianca'],
+                grain['area'],
+                grain['circularidade'],
+                grain['aspect_ratio'],
+                ", ".join(grain['defeitos'])
+            ])
+            
+    print(f"Detailed results saved to {csv_path}")
     
-        # We need the contours again to draw them correctly on the original image
-        # Since segment_grains returns masks, let's re-find contours on the masks or modify segment_grains to return contours/bboxes.
-        # For simplicity, let's just re-run the segmentation logic here or better, modify segment_grains to return more info.
-        # Actually, segment_grains returns cropped images, so we lost the original position.
-        # Let's refactor segment_grains slightly to return bounding boxes as well.
-        # Wait, I can't easily change the signature without breaking other things (though I am the only user).
-        # Let's just re-do the contour finding on the `opening` mask returned by segment_grains.
+    # Generate LLM Report if API key is available
+    if api_key:
+        print("\nGenerating AI Report...")
         
-        _, opening = segment_grains(processed_image) # Re-run to get the mask
-        contours, _ = cv2.findContours(opening, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Prepare data for LLM
+        # Map pipeline categories to simple Good/Bad for summary
+        good_count = (report['classificacao'].get(GrainQuality.EXCELENTE.value, 0) + 
+                     report['classificacao'].get(GrainQuality.BOM.value, 0))
         
-        # Filter contours exactly as in segment_grains
-        valid_contours = [c for c in contours if cv2.contourArea(c) >= 100]
+        bad_count = report['total_graos'] - good_count
         
-        # Ensure we have the same number of contours as results
-        if len(valid_contours) != len(results):
-            print("Warning: Mismatch between contours and results during visualization.")
+        summary_stats = {
+            "total": report['total_graos'],
+            "good": good_count,
+            "bad": bad_count,
+            "averages": report['estatisticas']
+        }
         
-        for i, (contour, result, feats) in enumerate(zip(valid_contours, results, all_features)):
-            x, y, w, h = cv2.boundingRect(contour)
+        # Prepare detailed results format expected by LLM function
+        detailed_results = []
+        for grain in report['graos']:
+            # Map quality to classification string
+            classification = "Good" if grain['qualidade'] in [GrainQuality.EXCELENTE.value, GrainQuality.BOM.value] else "Defect"
             
-            is_good = result['classification'] == "Good"
-            color = (0, 255, 0) if is_good else (0, 0, 255) # Green vs Red
+            detailed_results.append({
+                "classification": classification,
+                "reasons": grain['defeitos']
+            })
             
-            cv2.rectangle(result_image, (x, y), (x+w, y+h), color, 2)
+        try:
+            llm_report = analyze_grains_with_llm(
+                summary_stats=summary_stats,
+                detailed_results=detailed_results,
+                api_key=api_key,
+                image=annotated_image
+            )
             
-            label = "Good" if is_good else "Bad"
-            cv2.putText(result_image, str(i), (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            print("\n" + "="*50)
+            print("AI ANALYSIS REPORT")
+            print("="*50)
+            print(llm_report)
             
-            # Write to CSV
-            row = [i] + list(feats) + [result['classification'], "; ".join(result['reasons'])]
-            writer.writerow(row)
+            # Save report to text file
+            with open("ai_report.txt", "w", encoding="utf-8") as f:
+                f.write(llm_report)
+            print("\nReport saved to ai_report.txt")
             
-    output_path = "result.jpg"
-    cv2.imwrite(output_path, result_image)
-    print(f"Result image saved to {output_path}")
-    print("Features saved to features.csv")
+        except Exception as e:
+            print(f"\nError generating LLM report: {e}")
+    else:
+        print("\nSkipping AI report (no API key provided)")
 
 if __name__ == "__main__":
     main()
